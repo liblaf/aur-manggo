@@ -28,6 +28,7 @@ jobs:
       changed: ${{ steps.upstream.outputs.changed }}
       latest: ${{ steps.upstream.outputs.latest }}
       aur_sync: ${{ steps.aur.outputs.needed }}
+      maintenance_due: ${{ steps.health.outputs.needed }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -46,12 +47,29 @@ jobs:
           else
             echo 'needed=true' >> "$GITHUB_OUTPUT"
           fi
+      - name: Check whether monthly compatibility validation is due
+        id: health
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timedelta, timezone
+          from pathlib import Path
+          report = Path('automation-validation.json')
+          due = True
+          if report.exists():
+              checked = datetime.fromisoformat(json.loads(report.read_text())['validated_at'])
+              due = datetime.now(timezone.utc) - checked >= timedelta(days=28)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'needed={str(due).lower()}\n')
+          PY
 
   validate:
     needs: check
     if: >-
       needs.check.outputs.changed == 'true' ||
       needs.check.outputs.aur_sync == 'true' ||
+      needs.check.outputs.maintenance_due == 'true' ||
       github.event_name == 'push' ||
       github.event_name == 'pull_request' ||
       (github.event_name == 'workflow_dispatch' && inputs.validate_current)
@@ -95,6 +113,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: aur-metadata
@@ -102,13 +121,22 @@ jobs:
       - name: Prepare AUR authentication
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          GH_DEPLOY_KEY: ${{ secrets.GH_DEPLOY_KEY }}
         run: |
           umask 077
           printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/aur-key"
           ssh-keygen -y -P '' -f "$RUNNER_TEMP/aur-key" > /dev/null
+          printf '%s\n' "$GH_DEPLOY_KEY" > "$RUNNER_TEMP/github-key"
+          ssh-keygen -y -P '' -f "$RUNNER_TEMP/github-key" > /dev/null
       - name: Publish validated metadata to AUR and GitHub
         env:
           GIT_LFS_SKIP_PUSH: '1'
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_GIT_SSH_COMMAND: >-
+            ssh -i "${{ runner.temp }}/github-key" -o BatchMode=yes
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="${{ github.workspace }}/config/github-known-hosts"
+            -o ConnectTimeout=15
           GIT_SSH_COMMAND: >-
             ssh -i "${{ runner.temp }}/aur-key" -o BatchMode=yes
             -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
@@ -116,7 +144,7 @@ jobs:
             -o ConnectTimeout=15
         run: |
           git clone --quiet --branch master ssh://aur@aur.archlinux.org/manggo.git "$RUNNER_TEMP/aur"
-          python3 scripts/publish.py --candidate "$RUNNER_TEMP/candidate" --aur-checkout "$RUNNER_TEMP/aur" --branch main
+          python3 scripts/publish.py --candidate "$RUNNER_TEMP/candidate" --aur-checkout "$RUNNER_TEMP/aur" --branch main --record-validation
       - name: Remove temporary key
         if: always()
-        run: rm -f "$RUNNER_TEMP/aur-key"
+        run: rm -f "$RUNNER_TEMP/aur-key" "$RUNNER_TEMP/github-key"

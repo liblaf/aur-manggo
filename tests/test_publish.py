@@ -4,10 +4,13 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import tempfile
 import unittest
+from base64 import b64decode
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "publish.py"
@@ -71,7 +74,7 @@ class PublishTest(unittest.TestCase):
         self.aur = self.base / "aur"
         subprocess.run(("git", "clone", str(self.aur_remote), str(self.aur)), check=True,
                        stdout=subprocess.DEVNULL)
-        run(self.aur, "checkout", "-b", "master", "origin/master")
+        run(self.aur, "checkout", "-B", "master", "origin/master")
         self.candidate = self.base / "candidate"
         self.make_candidate()
         self.old_root = publish.ROOT
@@ -141,6 +144,53 @@ class PublishTest(unittest.TestCase):
         run(other, "push", "origin", "main")
         with self.assertRaisesRegex(publish.PublishError, "moved"):
             publish.publish(self.candidate, self.aur, "main")
+
+    def test_record_commit_uses_temporary_branch_and_expected_files(self) -> None:
+        calls: list[tuple[tuple[str, ...], dict | None]] = []
+
+        def fake_api(args: tuple[str, ...], payload: dict | None = None) -> dict:
+            calls.append((args, payload))
+            if args[0] == "graphql":
+                return {"data": {"createCommitOnBranch": {"commit": {
+                    "oid": "e" * 40, "url": "https://example.invalid/commit"}}}}
+            if args[0].startswith("repos/") and args[0].endswith("/git/commits/" + "e" * 40):
+                return {"verification": {"verified": True}}
+            return {}
+
+        git_calls: list[tuple[str, ...]] = []
+        with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo", "GITHUB_RUN_ID": "42",
+                                          "GITHUB_RUN_ATTEMPT": "3", "GITHUB_GIT_SSH_COMMAND": "ssh -i key"}), \
+                mock.patch.object(publish, "gh_api", side_effect=fake_api), \
+                mock.patch.object(publish, "git", side_effect=lambda _root, *args, **_kw: git_calls.append(args) or ""):
+            publish.api_commit("main", "f" * 40, "1.0.1", self.candidate, True)
+        mutation = calls[1][1]["variables"]["input"]
+        self.assertEqual(mutation["branch"]["branchName"], "aur-automation/42-3")
+        self.assertEqual(mutation["expectedHeadOid"], "f" * 40)
+        additions = mutation["fileChanges"]["additions"]
+        self.assertEqual([item["path"] for item in additions],
+                         ["PKGBUILD", ".SRCINFO", "automation-validation.json"])
+        report = json.loads(b64decode(additions[-1]["contents"]))
+        self.assertEqual(report["base_commit"], "f" * 40)
+        self.assertEqual(report["run_url"], "https://github.com/owner/repo/actions/runs/42")
+        self.assertIn(("fetch", "origin", "aur-automation/42-3"), git_calls)
+        self.assertIn(("push", "git@github.com:owner/repo.git", "e" * 40 + ":refs/heads/main"), git_calls)
+        self.assertEqual(calls[-1][0], ("--method", "DELETE", "repos/owner/repo/git/refs/heads/aur-automation/42-3"))
+
+    def test_record_commit_rejects_unsigned_result(self) -> None:
+        def fake_api(args: tuple[str, ...], payload: dict | None = None) -> dict:
+            if args[0] == "graphql":
+                return {"data": {"createCommitOnBranch": {"commit": {"oid": "e" * 40}}}}
+            if args[0].startswith("repos/") and "/git/commits/" in args[0]:
+                return {"verification": {"verified": False}}
+            return {}
+
+        with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo", "GITHUB_RUN_ID": "42",
+                                          "GITHUB_RUN_ATTEMPT": "3", "GITHUB_GIT_SSH_COMMAND": "ssh -i key"}), \
+                mock.patch.object(publish, "gh_api", side_effect=fake_api), \
+                mock.patch.object(publish, "git") as git_mock:
+            with self.assertRaisesRegex(publish.PublishError, "not verified"):
+                publish.api_commit("main", "f" * 40, "1.0.1", self.candidate, False)
+        git_mock.assert_not_called()
 
 
 if __name__ == "__main__":

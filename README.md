@@ -97,7 +97,8 @@ runtime support there.
 
 [GitHub Actions](https://github.com/liblaf/aur-manggo/actions/workflows/update.yml)
 checks the official download page hourly, at minute 17. Unchanged releases skip
-downloads and builds. A new release goes through these steps:
+downloads and builds, except for a compatibility recheck every 28 days. A new
+release goes through these steps:
 
 1. Require matching x86_64/ARM64 Debian releases and verify their control metadata.
 2. Update version/checksums and regenerate `.SRCINFO`.
@@ -106,7 +107,8 @@ downloads and builds. A new release goes through these steps:
    the application in Xvfb. Also validate ARM64 repackaging.
 5. Upload only the validated `PKGBUILD`, `.SRCINFO`, and integrity manifest.
 6. In a separate job, verify the candidate against the trusted recipe, publish
-   those two metadata files to AUR, then commit them to GitHub `main`.
+   those two metadata files to AUR, then make a verified GitHub commit with the
+   metadata and a validation record.
 
 Downloaded vendor code runs without the AUR key or a GitHub token with write
 access. Publication is restricted to this repository's `main` branch and scheduled
@@ -117,6 +119,18 @@ If AUR succeeds but the GitHub push fails, the next run can complete the GitHub
 commit without republishing AUR. AUR/GitHub differences also trigger validation
 when the upstream version is unchanged, allowing interrupted publication to retry.
 
+The publisher creates a server-signed commit on a temporary branch, verifies its
+signature through the GitHub API, and uses a repository-specific deploy key to
+fast-forward `main`. Temporary branches are removed. The `main-integrity` ruleset
+continues to require signatures and rejects deletion, branch creation, and force
+pushes. The separate `main-review` ruleset grants the deploy key a review bypass
+for automatic publication; human review rules remain in place.
+
+The generated `automation-validation.json` records the validated version, source
+commit, timestamp, and Actions run. Successful monthly rechecks keep the public
+repository active between releases. Bot commits skip redundant push validation;
+their originating scheduled/manual run has already validated the package.
+
 Run the complete workflow manually:
 
 ```bash
@@ -125,7 +139,8 @@ gh workflow run update.yml --repo liblaf/aur-manggo -f validate_current=true
 
 Pushes and pull requests also run validation, with publication disabled. Failure
 details are available on the Actions page. GitHub schedules can be delayed; public
-repository schedules may be disabled after 60 days without repository activity.
+repository schedules may be disabled after 60 days without repository activity
+if compatibility checks or publication have stopped succeeding.
 If necessary, re-enable this workflow with `gh workflow enable update.yml --repo
 liblaf/aur-manggo`. See [GitHub's schedule documentation](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
 
@@ -159,6 +174,13 @@ generate a new dedicated pair, register the new public key in AUR, update the
 GitHub secret, and run the workflow successfully before removing the old AUR key.
 Commit the new public file and fingerprint to keep the mapping current. Keep the
 personal SSH key separate; no private key belongs in Git history.
+
+A second key, stored as `GH_DEPLOY_KEY`, is a write deploy key scoped to this
+GitHub repository. Its public key is tracked in
+[config/github-actions-key.pub](https://github.com/liblaf/aur-manggo/blob/main/config/github-actions-key.pub),
+with fingerprint `SHA256:GFcGixE42/iruhDU/Kfep4JMNOk83/7tlq81uZfgdUQ`.
+This key is used to advance `main` only after GitHub has verified the server-signed
+commit. It is independent of the AUR publishing key.
 
 ## Publish updates to the AUR
 

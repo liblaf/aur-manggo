@@ -11,6 +11,8 @@ import re
 import shutil
 import subprocess
 import sys
+from base64 import b64encode
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +32,19 @@ def git(directory: Path, *args: str, env: dict[str, str] | None = None) -> str:
     if result.returncode:
         raise PublishError("git " + " ".join(args) + ": " + result.stderr.strip())
     return result.stdout.strip()
+
+
+def gh_api(args: tuple[str, ...], payload: dict | None = None) -> dict:
+    """Call GitHub CLI without exposing its token in command arguments."""
+    result = subprocess.run(("gh", "api", *args), text=True,
+                            input=json.dumps(payload) if payload is not None else None,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy())
+    if result.returncode:
+        raise PublishError("GitHub API request failed: " + result.stderr.strip())
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise PublishError("GitHub API returned invalid JSON") from error
 
 
 def sha256(path: Path) -> str:
@@ -79,7 +94,7 @@ def normalized_srcinfo(text: str, old: str, new: str) -> str:
     return "".join(lines)
 
 
-def validate(candidate: Path) -> tuple[str, str]:
+def validate(candidate: Path) -> tuple[str, str, str]:
     if not candidate.is_dir() or set(path.name for path in candidate.iterdir()) != {
             "PKGBUILD", ".SRCINFO", "manifest.json"}:
         raise PublishError("candidate must contain exactly PKGBUILD, .SRCINFO, and manifest.json")
@@ -130,7 +145,7 @@ def validate(candidate: Path) -> tuple[str, str]:
     for arch in ("x86_64", "aarch64"):
         if src_value(proposed_srcinfo, f"sha256sums_{arch}") != value(proposed, f"sha256sums_{arch}").strip("()'\""):
             raise PublishError(".SRCINFO checksum disagrees with PKGBUILD")
-    return new, old
+    return new, old, manifest["base_commit"]
 
 
 def pair(directory: Path) -> tuple[bytes, bytes]:
@@ -145,8 +160,70 @@ def copy_pair(source: Path, destination: Path) -> None:
         shutil.copyfile(source / name, destination / name)
 
 
-def publish(candidate: Path, aur: Path, branch: str) -> None:
-    version, _ = validate(candidate)
+def validation_report(version: str, base: str) -> bytes:
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if not repository or not run_id:
+        raise PublishError("record-validation requires GITHUB_REPOSITORY and GITHUB_RUN_ID")
+    server = os.environ.get("GITHUB_SERVER_URL", "https://github.com").rstrip("/")
+    report = {
+        "base_commit": base,
+        "run_url": f"{server}/{repository}/actions/runs/{run_id}",
+        "validated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "version": version,
+    }
+    return (json.dumps(report, indent=2, sort_keys=True) + "\n").encode()
+
+
+def api_commit(branch: str, base: str, version: str, candidate: Path,
+               include_metadata: bool) -> None:
+    repository = os.environ.get("GITHUB_REPOSITORY")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    attempt = os.environ.get("GITHUB_RUN_ATTEMPT")
+    ssh_command = os.environ.get("GITHUB_GIT_SSH_COMMAND")
+    if not repository or not run_id or not attempt or not ssh_command:
+        raise PublishError("record-validation requires GitHub Actions repository, run, and deploy-key settings")
+    if not run_id.isdecimal() or not attempt.isdecimal():
+        raise PublishError("GitHub Actions run identifiers are invalid")
+    temporary_branch = f"aur-automation/{run_id}-{attempt}"
+    additions = [{"path": "automation-validation.json",
+                  "contents": b64encode(validation_report(version, base)).decode()}]
+    if include_metadata:
+        additions = [{"path": name, "contents": b64encode((candidate / name).read_bytes()).decode()}
+                     for name in FILES] + additions
+    query = ("mutation($input: CreateCommitOnBranchInput!) { "
+             "createCommitOnBranch(input: $input) { commit { oid url } } }")
+    payload = {"query": query, "variables": {"input": {
+        "branch": {"repositoryNameWithOwner": repository, "branchName": temporary_branch},
+        "expectedHeadOid": base,
+        "message": {"headline": f"chore: record Manggo validation for {version} [skip ci]"},
+        "fileChanges": {"additions": additions},
+    }}}
+    gh_api(("--method", "POST", f"repos/{repository}/git/refs", "--input", "-"),
+           {"ref": f"refs/heads/{temporary_branch}", "sha": base})
+    created = True
+    try:
+        response = gh_api(("graphql", "--input", "-"), payload)
+        commit = response["data"]["createCommitOnBranch"]["commit"]
+        oid = commit["oid"]
+        if not isinstance(oid, str) or not COMMIT.fullmatch(oid):
+            raise PublishError("GitHub did not return a valid validation commit")
+        verification = gh_api((f"repos/{repository}/git/commits/{oid}",)).get("verification", {})
+        if verification.get("verified") is not True:
+            raise PublishError("GitHub validation commit is not verified")
+        git(ROOT, "fetch", "origin", temporary_branch)
+        push_env = os.environ.copy()
+        push_env["GIT_SSH_COMMAND"] = ssh_command
+        git(ROOT, "push", f"git@github.com:{repository}.git", f"{oid}:refs/heads/{branch}", env=push_env)
+    except (KeyError, TypeError) as error:
+        raise PublishError("GitHub did not create the validation commit") from error
+    finally:
+        if created:
+            gh_api(("--method", "DELETE", f"repos/{repository}/git/refs/heads/{temporary_branch}"))
+
+
+def publish(candidate: Path, aur: Path, branch: str, record_validation: bool = False) -> None:
+    version, _, _ = validate(candidate)
     if branch != "main" or git(ROOT, "branch", "--show-current") != branch:
         raise PublishError("GitHub checkout must be on main")
     git(ROOT, "diff", "--quiet")
@@ -170,7 +247,9 @@ def publish(candidate: Path, aur: Path, branch: str) -> None:
         push_env = os.environ.copy()
         push_env["GIT_LFS_SKIP_PUSH"] = "1"
         git(aur, "push", "origin", "HEAD:master", env=push_env)
-    if expected != proposed:
+    if record_validation:
+        api_commit(branch, base, version, candidate, expected != proposed)
+    elif expected != proposed:
         copy_pair(candidate, ROOT)
         git(ROOT, "add", *FILES)
         git(ROOT, "config", "user.name", "github-actions[bot]")
@@ -184,9 +263,12 @@ def main() -> int:
     parser.add_argument("--candidate", type=Path, required=True)
     parser.add_argument("--aur-checkout", type=Path, required=True)
     parser.add_argument("--branch", default="main")
+    parser.add_argument("--record-validation", action="store_true",
+                        help="record validation through GitHub's signed commit API")
     args = parser.parse_args()
     try:
-        publish(args.candidate.resolve(), args.aur_checkout.resolve(), args.branch)
+        publish(args.candidate.resolve(), args.aur_checkout.resolve(), args.branch,
+                args.record_validation)
     except PublishError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
