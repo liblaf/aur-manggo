@@ -5,7 +5,7 @@
 set -euo pipefail
 
 pacman -Syu --needed --noconfirm \
-  base-devel python patchelf namcap shellcheck desktop-file-utils \
+  base-devel git python patchelf namcap shellcheck desktop-file-utils \
   xorg-server-xvfb xorg-xwininfo ttf-dejavu > /tmp/setup.log 2>&1 || {
   tail -60 /tmp/setup.log
   exit 1

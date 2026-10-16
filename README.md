@@ -112,7 +112,8 @@ release goes through these steps:
 
 Downloaded vendor code runs without the AUR key or a GitHub token with write
 access. Publication is restricted to this repository's `main` branch and scheduled
-or manual runs. Concurrent update runs are serialized. Unexpected recipe changes,
+or manual runs. Both publishing keys are environment secrets in `aur-publish`,
+whose deployment policy permits only `main`. Concurrent update runs are serialized. Unexpected recipe changes,
 upstream formats, missing dependencies, and divergent AUR edits stop publication.
 
 If AUR succeeds but the GitHub push fails, the next run can complete the GitHub
@@ -147,7 +148,7 @@ liblaf/aur-manggo`. See [GitHub's schedule documentation](https://docs.github.co
 ## Automation key identity and recovery
 
 The workflow uses a dedicated Ed25519 key registered to the AUR account `liblaf`.
-Its private half is stored as the encrypted repository secret
+Its private half is stored as the encrypted `aur-publish` environment secret
 `AUR_SSH_PRIVATE_KEY`. Its public half is tracked in
 [config/aur-actions-key.pub](https://github.com/liblaf/aur-manggo/blob/main/config/aur-actions-key.pub).
 

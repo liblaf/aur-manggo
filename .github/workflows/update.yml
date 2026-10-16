@@ -101,6 +101,7 @@ jobs:
 
   publish:
     needs: [check, validate]
+    environment: aur-publish
     if: >-
       github.repository == 'liblaf/aur-manggo' &&
       github.ref == 'refs/heads/main' &&
