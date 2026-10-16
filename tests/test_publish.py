@@ -50,8 +50,8 @@ class PublishTest(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.remote = self.base / "github.git"
         self.aur_remote = self.base / "aur.git"
-        for remote in (self.remote, self.aur_remote):
-            subprocess.run(("git", "init", "--bare", str(remote)), check=True,
+        for remote, branch in ((self.remote, "main"), (self.aur_remote, "master")):
+            subprocess.run(("git", "init", "--bare", f"--initial-branch={branch}", str(remote)), check=True,
                            stdout=subprocess.DEVNULL)
         self.root = self.base / "github"
         subprocess.run(("git", "clone", str(self.remote), str(self.root)), check=True,
