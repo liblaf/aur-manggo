@@ -41,6 +41,8 @@ def gh_api(args: tuple[str, ...], payload: dict | None = None) -> dict:
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=os.environ.copy())
     if result.returncode:
         raise PublishError("GitHub API request failed: " + result.stderr.strip())
+    if not result.stdout.strip():
+        return {}
     try:
         return json.loads(result.stdout)
     except json.JSONDecodeError as error:

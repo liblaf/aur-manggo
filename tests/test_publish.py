@@ -193,5 +193,12 @@ class PublishTest(unittest.TestCase):
         git_mock.assert_not_called()
 
 
+class GitHubApiTest(unittest.TestCase):
+    def test_successful_no_content_response_is_accepted(self) -> None:
+        response = subprocess.CompletedProcess(('gh', 'api'), 0, '', '')
+        with mock.patch.object(publish.subprocess, 'run', return_value=response):
+            self.assertEqual(publish.gh_api(('--method', 'DELETE', 'repos/owner/repo/git/refs/heads/temp')), {})
+
+
 if __name__ == "__main__":
     unittest.main()
