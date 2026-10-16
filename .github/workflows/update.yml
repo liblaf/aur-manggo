@@ -1,0 +1,122 @@
+name: Validate and update Manggo
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      validate_current:
+        description: Validate and synchronize the current package even without a new release
+        type: boolean
+        default: true
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: manggo-${{ github.event_name == 'pull_request' && github.ref || 'update' }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.upstream.outputs.changed }}
+      latest: ${{ steps.upstream.outputs.latest }}
+      aur_sync: ${{ steps.aur.outputs.needed }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Test release and publication safeguards
+        run: python3 -m unittest discover -s tests -v
+      - name: Check official release metadata
+        id: upstream
+        run: python3 scripts/update.py --check --github-output "$GITHUB_OUTPUT"
+      - name: Check whether AUR needs synchronization
+        id: aur
+        run: |
+          git clone --quiet --depth 1 https://aur.archlinux.org/manggo.git "$RUNNER_TEMP/aur-state"
+          if cmp -s PKGBUILD "$RUNNER_TEMP/aur-state/PKGBUILD" && cmp -s .SRCINFO "$RUNNER_TEMP/aur-state/.SRCINFO"; then
+            echo 'needed=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'needed=true' >> "$GITHUB_OUTPUT"
+          fi
+
+  validate:
+    needs: check
+    if: >-
+      needs.check.outputs.changed == 'true' ||
+      needs.check.outputs.aur_sync == 'true' ||
+      github.event_name == 'push' ||
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && inputs.validate_current)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Build, install, and launch in a disposable Arch environment
+        run: |
+          mkdir -p "$RUNNER_TEMP/candidate"
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" \
+            --volume "$RUNNER_TEMP/candidate:/candidate" \
+            --env "BASE_COMMIT=$GITHUB_SHA" \
+            archlinux:base bash /workspace/scripts/validate.sh
+      - name: Upload only validated package metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aur-metadata
+          path: |
+            ${{ runner.temp }}/candidate/PKGBUILD
+            ${{ runner.temp }}/candidate/.SRCINFO
+            ${{ runner.temp }}/candidate/manifest.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    needs: [check, validate]
+    if: >-
+      github.repository == 'liblaf/aur-manggo' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: aur-metadata
+          path: ${{ runner.temp }}/candidate
+      - name: Prepare AUR authentication
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          umask 077
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$RUNNER_TEMP/aur-key"
+          ssh-keygen -y -P '' -f "$RUNNER_TEMP/aur-key" > /dev/null
+      - name: Publish validated metadata to AUR and GitHub
+        env:
+          GIT_LFS_SKIP_PUSH: '1'
+          GIT_SSH_COMMAND: >-
+            ssh -i "${{ runner.temp }}/aur-key" -o BatchMode=yes
+            -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile="${{ github.workspace }}/config/aur-known-hosts"
+            -o ConnectTimeout=15
+        run: |
+          git clone --quiet --branch master ssh://aur@aur.archlinux.org/manggo.git "$RUNNER_TEMP/aur"
+          python3 scripts/publish.py --candidate "$RUNNER_TEMP/candidate" --aur-checkout "$RUNNER_TEMP/aur" --branch main
+      - name: Remove temporary key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/aur-key"

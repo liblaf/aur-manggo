@@ -47,7 +47,12 @@ def package_value(text: str, name: str) -> str:
 
 
 def version_cmp(left: str, right: str) -> int:
-    return int(command("vercmp", left, right).decode().strip())
+    for version in (left, right):
+        if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+            raise UpdateError(f"unsupported stable version: {version}")
+    first = tuple(map(int, left.split(".")))
+    second = tuple(map(int, right.split(".")))
+    return (first > second) - (first < second)
 
 
 def releases() -> tuple[str, dict[str, str]]:
@@ -174,6 +179,8 @@ def main() -> int:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="only query and validate release metadata")
     mode.add_argument("--update", action="store_true", help="download, validate, and update package metadata")
+    parser.add_argument("--github-output", type=Path,
+                        help="append changed/latest outputs for GitHub Actions")
     args = parser.parse_args()
     try:
         original = PKGBUILD.read_text()
@@ -185,8 +192,11 @@ def main() -> int:
             raise UpdateError("official release is older than the packaged version")
         if not args.update:
             print("new release available" if comparison > 0 else "already current")
-            return 0
-        update(current, latest, urls, original)
+        else:
+            update(current, latest, urls, original)
+        if args.github_output:
+            with args.github_output.open("a") as output:
+                output.write(f"changed={'true' if comparison > 0 else 'false'}\nlatest={latest}\n")
         return 0
     except (UpdateError, OSError, UnicodeError) as error:
         print(f"error: {error}", file=sys.stderr)
