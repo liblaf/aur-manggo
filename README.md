@@ -96,9 +96,9 @@ runtime support there.
 ## Automated updates
 
 [GitHub Actions](https://github.com/liblaf/aur-manggo/actions/workflows/update.yml)
-checks the official download page hourly, at minute 17. Unchanged releases skip
-downloads and builds, except for a compatibility recheck every 28 days. A new
-release goes through these steps:
+checks the official download page daily at 09:17 Asia/Shanghai (01:17 UTC).
+Unchanged releases skip downloads and builds, except for a compatibility recheck
+every 28 days. A new release goes through these steps:
 
 1. Require matching x86_64/ARM64 Debian releases and verify their control metadata.
 2. Update version/checksums and regenerate `.SRCINFO`.
