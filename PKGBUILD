@@ -1,5 +1,5 @@
 # Maintainer: liblaf <30631553+liblaf@users.noreply.github.com>
-# SPDX-License-Identifier: 0BSD
+# SPDX-License-Identifier: MIT
 # shellcheck shell=bash disable=SC2034,SC2154
 
 pkgname=manggo

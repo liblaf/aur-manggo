@@ -209,7 +209,7 @@ Debian files, built Arch packages, or build directories.
 
 ## License
 
-The packaging code is licensed under **0BSD**; see the included `LICENSE`.
+The packaging code is licensed under **MIT**; see the included `LICENSE`.
 Manggo itself is **proprietary**, governed by its [user agreement](https://manggo.pylogmon.cn/terms).
 The package installs the exact vendor license and agreement under
 `/usr/share/licenses/manggo`; bundled third-party notices are preserved.

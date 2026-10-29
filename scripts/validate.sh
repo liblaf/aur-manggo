@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: 0BSD
+# SPDX-License-Identifier: MIT
 # shellcheck disable=SC2154
 # Run inside a disposable official Arch container; never pass secrets to it.
 set -euo pipefail

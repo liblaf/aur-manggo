@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: 0BSD
+# SPDX-License-Identifier: MIT
 """Publish a checked candidate to AUR and prepare files for commit-action."""
 from __future__ import annotations
 

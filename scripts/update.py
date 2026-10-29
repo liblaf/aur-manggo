@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: 0BSD
+# SPDX-License-Identifier: MIT
 """Safely check for, and update to, official Manggo Debian releases."""
 
 from __future__ import annotations
