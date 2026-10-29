@@ -8,7 +8,6 @@ import os
 import subprocess
 import tempfile
 import unittest
-from base64 import b64decode
 from pathlib import Path
 from unittest import mock
 
@@ -56,6 +55,7 @@ class PublishTest(unittest.TestCase):
         self.root = self.base / "github"
         subprocess.run(("git", "clone", str(self.remote), str(self.root)), check=True,
                        stdout=subprocess.DEVNULL)
+        run(self.root, "config", "core.hooksPath", "/dev/null")
         self.write_pair(self.root, PKG, SRC)
         run(self.root, "add", "PKGBUILD", ".SRCINFO")
         run(self.root, "-c", "user.name=test", "-c", "user.email=test@example.invalid",
@@ -65,6 +65,7 @@ class PublishTest(unittest.TestCase):
         self.aur_seed = self.base / "aur-seed"
         subprocess.run(("git", "clone", str(self.aur_remote), str(self.aur_seed)), check=True,
                        stdout=subprocess.DEVNULL)
+        run(self.aur_seed, "config", "core.hooksPath", "/dev/null")
         self.write_pair(self.aur_seed, PKG, SRC)
         run(self.aur_seed, "add", "PKGBUILD", ".SRCINFO")
         run(self.aur_seed, "-c", "user.name=test", "-c", "user.email=test@example.invalid",
@@ -74,6 +75,7 @@ class PublishTest(unittest.TestCase):
         self.aur = self.base / "aur"
         subprocess.run(("git", "clone", str(self.aur_remote), str(self.aur)), check=True,
                        stdout=subprocess.DEVNULL)
+        run(self.aur, "config", "core.hooksPath", "/dev/null")
         run(self.aur, "checkout", "-B", "master", "origin/master")
         self.candidate = self.base / "candidate"
         self.make_candidate()
@@ -105,20 +107,109 @@ class PublishTest(unittest.TestCase):
                               for name in publish.FILES}
         (self.candidate / "manifest.json").write_text(json.dumps(manifest))
 
-    def test_publishes_aur_then_github_and_retries(self) -> None:
+    def assert_github_uncommitted(self, head: str) -> None:
+        self.assertEqual(run(self.root, "rev-parse", "HEAD"), head)
+        self.assertEqual(run(self.remote, "rev-parse", "refs/heads/main"), head)
+        self.assertEqual(run(self.root, "diff", "--cached", "--name-only"), "")
+        for name in publish.FILES:
+            self.assertEqual((self.root / name).read_bytes(), (self.candidate / name).read_bytes())
+        self.assertFalse((self.root / "manifest.json").exists())
+
+    def commit_prepared_files(self) -> None:
+        run(self.root, "add", *publish.FILES, "automation-validation.json")
+        run(self.root, "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+            "commit", "-m", "emulated commit-action")
+        run(self.root, "push", "origin", "main")
+
+    def test_publishes_aur_and_prepares_github_metadata(self) -> None:
+        head = run(self.root, "rev-parse", "HEAD")
         publish.publish(self.candidate, self.aur, "main")
-        self.assertEqual((self.root / "PKGBUILD").read_text(), (self.candidate / "PKGBUILD").read_text())
+        self.assert_github_uncommitted(head)
+        self.assertFalse((self.root / "automation-validation.json").exists())
         self.assertEqual(run(self.aur, "log", "-1", "--format=%s"), "Update manggo to 1.0.1")
-        self.assertEqual(run(self.root, "log", "-1", "--format=%s"), "chore: update Manggo to 1.0.1")
-        publish.publish(self.candidate, self.aur, "main")
+        for name in publish.FILES:
+            self.assertEqual(run(self.aur_remote, "show", f"master:{name}"),
+                             (self.candidate / name).read_text().strip())
+
+    def test_publishes_aur_before_preparing_files_and_report(self) -> None:
+        head = run(self.root, "rev-parse", "HEAD")
+        original = publish.pair(self.root)
+        real_git = publish.git
+        pushed = False
+
+        def inspect_git(directory: Path, *args: str, **kwargs: object) -> str:
+            nonlocal pushed
+            if directory == self.aur and args[0] == "push":
+                self.assertEqual(publish.pair(self.root), original)
+                self.assertFalse((self.root / "automation-validation.json").exists())
+                result = real_git(directory, *args, **kwargs)
+                pushed = True
+                return result
+            return real_git(directory, *args, **kwargs)
+
+        with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo", "GITHUB_RUN_ID": "42"}), \
+                mock.patch.object(publish, "git", side_effect=inspect_git):
+            publish.publish(self.candidate, self.aur, "main", record_validation=True)
+        self.assertTrue(pushed)
+        self.assert_github_uncommitted(head)
+        report = json.loads((self.root / "automation-validation.json").read_bytes())
+        self.assertEqual(report["base_commit"], head)
+        self.assertEqual(report["run_url"], "https://github.com/owner/repo/actions/runs/42")
+        self.assertEqual(report["version"], "1.0.1")
+        self.assertRegex(report["validated_at"], r"^\d{4}-\d\d-\d\dT.*Z$")
+        self.assertEqual(set(report), {"base_commit", "run_url", "validated_at", "version"})
+
+    def test_replays_after_successful_github_commit(self) -> None:
+        with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo", "GITHUB_RUN_ID": "42"}):
+            publish.publish(self.candidate, self.aur, "main", record_validation=True)
+            self.commit_prepared_files()
+            head = run(self.root, "rev-parse", "HEAD")
+            aur_head = run(self.aur_remote, "rev-parse", "master")
+            publish.publish(self.candidate, self.aur, "main", record_validation=True)
+        self.assert_github_uncommitted(head)
+        self.assertEqual(run(self.aur_remote, "rev-parse", "master"), aur_head)
+        report = json.loads((self.root / "automation-validation.json").read_text())
+        self.assertEqual(report["base_commit"], head)
 
     def test_recovers_when_aur_was_already_published(self) -> None:
-        self.write_pair(self.aur, *( (self.candidate / name).read_text() for name in publish.FILES))
+        head = run(self.root, "rev-parse", "HEAD")
+        self.write_pair(self.aur, *((self.candidate / name).read_text() for name in publish.FILES))
         run(self.aur, "add", "PKGBUILD", ".SRCINFO")
         run(self.aur, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "prior")
         run(self.aur, "push", "origin", "HEAD:master")
+        aur_head = run(self.aur_remote, "rev-parse", "master")
         publish.publish(self.candidate, self.aur, "main")
-        self.assertEqual((self.root / ".SRCINFO").read_text(), (self.candidate / ".SRCINFO").read_text())
+        self.assert_github_uncommitted(head)
+        self.assertEqual(run(self.aur_remote, "rev-parse", "master"), aur_head)
+
+    def test_same_version_prepares_only_validation_report(self) -> None:
+        self.write_pair(self.candidate, PKG, SRC)
+        manifest = json.loads((self.candidate / "manifest.json").read_text())
+        manifest["version"] = "1.0.0"
+        (self.candidate / "manifest.json").write_text(json.dumps(manifest))
+        self.refresh_manifest()
+        head = run(self.root, "rev-parse", "HEAD")
+        aur_head = run(self.aur_remote, "rev-parse", "master")
+        with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo", "GITHUB_RUN_ID": "42"}):
+            publish.publish(self.candidate, self.aur, "main", record_validation=True)
+        self.assert_github_uncommitted(head)
+        self.assertEqual(run(self.root, "diff", "--name-only"), "")
+        self.assertEqual(run(self.root, "ls-files", "--others", "--exclude-standard"), "automation-validation.json")
+        self.assertEqual(run(self.aur_remote, "rev-parse", "master"), aur_head)
+        report = json.loads((self.root / "automation-validation.json").read_text())
+        self.assertEqual(report["version"], "1.0.0")
+
+    def test_missing_actions_context_fails_before_aur_mutation(self) -> None:
+        aur_head = run(self.aur, "rev-parse", "HEAD")
+        original = publish.pair(self.root)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaisesRegex(publish.PublishError, "GITHUB_REPOSITORY and GITHUB_RUN_ID"):
+                publish.publish(self.candidate, self.aur, "main", record_validation=True)
+        self.assertEqual(run(self.aur, "rev-parse", "HEAD"), aur_head)
+        self.assertEqual(run(self.aur_remote, "rev-parse", "master"), aur_head)
+        self.assertEqual(publish.pair(self.aur), original)
+        self.assertEqual(publish.pair(self.root), original)
+        self.assertFalse((self.root / "automation-validation.json").exists())
 
     def test_rejects_a_candidate_that_changes_the_baseline(self) -> None:
         path = self.candidate / "PKGBUILD"
@@ -138,66 +229,13 @@ class PublishTest(unittest.TestCase):
         other = self.base / "other"
         subprocess.run(("git", "clone", str(self.remote), str(other)), check=True,
                        stdout=subprocess.DEVNULL)
+        run(other, "config", "core.hooksPath", "/dev/null")
         (other / "note").write_text("moved\n")
         run(other, "add", "note")
         run(other, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "commit", "-m", "moved")
         run(other, "push", "origin", "main")
         with self.assertRaisesRegex(publish.PublishError, "moved"):
             publish.publish(self.candidate, self.aur, "main")
-
-    def test_record_commit_uses_temporary_branch_and_expected_files(self) -> None:
-        calls: list[tuple[tuple[str, ...], dict | None]] = []
-
-        def fake_api(args: tuple[str, ...], payload: dict | None = None) -> dict:
-            calls.append((args, payload))
-            if args[0] == "graphql":
-                return {"data": {"createCommitOnBranch": {"commit": {
-                    "oid": "e" * 40, "url": "https://example.invalid/commit"}}}}
-            if args[0].startswith("repos/") and args[0].endswith("/git/commits/" + "e" * 40):
-                return {"verification": {"verified": True}}
-            return {}
-
-        git_calls: list[tuple[str, ...]] = []
-        with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo", "GITHUB_RUN_ID": "42",
-                                          "GITHUB_RUN_ATTEMPT": "3", "GITHUB_GIT_SSH_COMMAND": "ssh -i key"}), \
-                mock.patch.object(publish, "gh_api", side_effect=fake_api), \
-                mock.patch.object(publish, "git", side_effect=lambda _root, *args, **_kw: git_calls.append(args) or ""):
-            publish.api_commit("main", "f" * 40, "1.0.1", self.candidate, True)
-        mutation = calls[1][1]["variables"]["input"]
-        self.assertEqual(mutation["branch"]["branchName"], "aur-automation/42-3")
-        self.assertEqual(mutation["expectedHeadOid"], "f" * 40)
-        additions = mutation["fileChanges"]["additions"]
-        self.assertEqual([item["path"] for item in additions],
-                         ["PKGBUILD", ".SRCINFO", "automation-validation.json"])
-        report = json.loads(b64decode(additions[-1]["contents"]))
-        self.assertEqual(report["base_commit"], "f" * 40)
-        self.assertEqual(report["run_url"], "https://github.com/owner/repo/actions/runs/42")
-        self.assertIn(("fetch", "origin", "aur-automation/42-3"), git_calls)
-        self.assertIn(("push", "git@github.com:owner/repo.git", "e" * 40 + ":refs/heads/main"), git_calls)
-        self.assertEqual(calls[-1][0], ("--method", "DELETE", "repos/owner/repo/git/refs/heads/aur-automation/42-3"))
-
-    def test_record_commit_rejects_unsigned_result(self) -> None:
-        def fake_api(args: tuple[str, ...], payload: dict | None = None) -> dict:
-            if args[0] == "graphql":
-                return {"data": {"createCommitOnBranch": {"commit": {"oid": "e" * 40}}}}
-            if args[0].startswith("repos/") and "/git/commits/" in args[0]:
-                return {"verification": {"verified": False}}
-            return {}
-
-        with mock.patch.dict(os.environ, {"GITHUB_REPOSITORY": "owner/repo", "GITHUB_RUN_ID": "42",
-                                          "GITHUB_RUN_ATTEMPT": "3", "GITHUB_GIT_SSH_COMMAND": "ssh -i key"}), \
-                mock.patch.object(publish, "gh_api", side_effect=fake_api), \
-                mock.patch.object(publish, "git") as git_mock:
-            with self.assertRaisesRegex(publish.PublishError, "not verified"):
-                publish.api_commit("main", "f" * 40, "1.0.1", self.candidate, False)
-        git_mock.assert_not_called()
-
-
-class GitHubApiTest(unittest.TestCase):
-    def test_successful_no_content_response_is_accepted(self) -> None:
-        response = subprocess.CompletedProcess(('gh', 'api'), 0, '', '')
-        with mock.patch.object(publish.subprocess, 'run', return_value=response):
-            self.assertEqual(publish.gh_api(('--method', 'DELETE', 'repos/owner/repo/git/refs/heads/temp')), {})
 
 
 if __name__ == "__main__":

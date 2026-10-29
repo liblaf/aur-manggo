@@ -112,7 +112,7 @@ every 28 days. A new release goes through these steps:
 
 Downloaded vendor code runs without the AUR key or a GitHub token with write
 access. Publication is restricted to this repository's `main` branch and scheduled
-or manual runs. Both publishing keys are environment secrets in `aur-publish`,
+or manual runs. The AUR publishing key is an environment secret in `aur-publish`,
 whose deployment policy permits only `main`. Concurrent update runs are serialized. Unexpected recipe changes,
 upstream formats, missing dependencies, and divergent AUR edits stop publication.
 
@@ -120,17 +120,22 @@ If AUR succeeds but the GitHub push fails, the next run can complete the GitHub
 commit without republishing AUR. AUR/GitHub differences also trigger validation
 when the upstream version is unchanged, allowing interrupted publication to retry.
 
-The publisher creates a server-signed commit on a temporary branch, verifies its
-signature through the GitHub API, and uses a repository-specific deploy key to
-fast-forward `main`. Temporary branches are removed. The `main-integrity` ruleset
-continues to require signatures and rejects deletion, branch creation, and force
-pushes. The separate `main-review` ruleset grants the deploy key a review bypass
-for automatic publication; human review rules remain in place.
+After publishing to AUR, the publisher prepares the validated metadata and report
+in the GitHub checkout. The workflow uses
+[`suzuki-shunsuke/commit-action`](https://github.com/suzuki-shunsuke/commit-action)
+with `GITHUB_TOKEN` and `contents: write` to create a verified commit on
+a temporary branch based on the validated source commit. Only `PKGBUILD`,
+`.SRCINFO`, and `automation-validation.json` can be included. After verifying the
+signature, the token advances `main` by fast-forward and removes the temporary
+branch. Concurrent changes to `main` stop publication. Branch rules require
+verified signatures and reject deletion, branch creation, and force pushes on
+`main`. Pull requests are optional.
 
 The generated `automation-validation.json` records the validated version, source
 commit, timestamp, and Actions run. Successful monthly rechecks keep the public
-repository active between releases. Bot commits skip redundant push validation;
-their originating scheduled/manual run has already validated the package.
+repository active between releases. Commits made with `GITHUB_TOKEN` do not
+trigger another workflow run; the originating scheduled/manual run has already
+validated the package.
 
 Run the complete workflow manually:
 
@@ -176,12 +181,8 @@ GitHub secret, and run the workflow successfully before removing the old AUR key
 Commit the new public file and fingerprint to keep the mapping current. Keep the
 personal SSH key separate; no private key belongs in Git history.
 
-A second key, stored as `GH_DEPLOY_KEY`, is a write deploy key scoped to this
-GitHub repository. Its public key is tracked in
-[config/github-actions-key.pub](https://github.com/liblaf/aur-manggo/blob/main/config/github-actions-key.pub),
-with fingerprint `SHA256:GFcGixE42/iruhDU/Kfep4JMNOk83/7tlq81uZfgdUQ`.
-This key is used to advance `main` only after GitHub has verified the server-signed
-commit. It is independent of the AUR publishing key.
+GitHub publication uses the workflow's temporary `GITHUB_TOKEN`; it requires no
+additional SSH key or private-key secret.
 
 ## Publish updates to the AUR
 
